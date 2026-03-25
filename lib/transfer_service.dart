@@ -3,6 +3,9 @@ import 'dart:io';
 import 'package:logger/logger.dart';
 import 'config.dart';
 import 'dart:async';
+import 'home_provider.dart';
+import 'package:path/path.dart' as path;
+import 'transfer_history_manager.dart';
 
 class TransferTask{
   Socket client;
@@ -24,9 +27,6 @@ class TransferService {
 
       var fileDataStreamController = StreamController<List<int>>(); // 这里暂时用一个空流占位，实际使用时需要根据协议来确定何时开始传输文件数据      
       bool handledRequest = false; // 标记是否已经处理过请求
-      int totalBytesReceived = 0; // 用于统计接收的字节数
-      int expectedFileSize = 0; // 预期的文件大小，初始为0，实际使用时需要根据协议来确定何时设置这个值
-
       client.listen((data) {
         if(!handledRequest){
           try{
@@ -34,7 +34,6 @@ class TransferService {
               Logger().i("Received message: $message");
               handledRequest = true; // 标记已经处理过请求，后续数据将被视为文件数据
               if(message["type"] == "request_to_send"){
-                expectedFileSize = message["size"] ?? 0; // 从消息中获取预期的文件大小
                 Future.delayed(const Duration(milliseconds: 500), (){
                   _controller.add(TransferTask(client: client, message: message, fileDataStream: fileDataStreamController.stream));
                 });
@@ -51,7 +50,6 @@ class TransferService {
         else{
           if(!fileDataStreamController.isClosed){
             fileDataStreamController.add(data); // 将后续数据视为文件数据
-            totalBytesReceived += data.length;
             }
           }
       },
@@ -84,6 +82,7 @@ class TransferService {
       "message": "请求已被接受，准备发送文件"
     };
     client.add(utf8.encode(jsonEncode(response)));
+    client.flush();
   }
 
   void rejectTransferRequest(TransferTask task){
@@ -95,8 +94,91 @@ class TransferService {
       "message": "请求已被拒绝"
     };
     client.add(utf8.encode(jsonEncode(response)));
+    client.flush();
     client.close();
   }
+
+  Future<void> performTransfer(TransferTaskInfo uiTask, Socket socket, {String? filePath, Stream<List<int>>? dataStream}) async {
+    String Save_Path = "";
+  try {
+    if (uiTask.isSender) {
+        File file = File(filePath!);
+        try {
+          final fileStream = file.openRead();
+          
+          await for (List<int> chunk in fileStream) {
+            socket.add(chunk); // 往 Socket 缓冲区塞数据
+            uiTask.progress += chunk.length; // 更新已发送的字节数
+            await socket.flush(); // 确保数据被发送出去
+          }
+
+          uiTask.isDone = true;
+        }catch (e) {
+          // 发送过程中发生错误
+          uiTask.errorMsg = "发送失败: $e";
+        }
+      }else{
+        try{
+          final directory = Directory(Config.receivedFilesDir);
+          if (!await directory.exists()) {
+            await directory.create(recursive: true);
+          }
+
+          
+
+          IOSink? sink;
+        
+          String savePath = path.join(Config.receivedFilesDir, uiTask.fileName);
+          int count = 1;
+          while (await File(savePath).exists()) {
+            savePath = path.join(Config.receivedFilesDir, "copy_$count${uiTask.fileName}");
+            count++;
+          }
+
+          Save_Path = savePath;
+          File saveFile = File(savePath);
+          sink = saveFile.openWrite();
+        
+          DateTime _lastUpdateTime = DateTime.now();
+
+          // 在 _receiveAction 的循环中
+          await for (List<int> chunk in dataStream!) {
+            sink.add(chunk);
+            uiTask.progress += chunk.length;
+
+            // 每隔 100ms 或者传输完成时才更新 UI
+            DateTime now = DateTime.now();
+            if (now.difference(_lastUpdateTime).inMilliseconds > 100 || uiTask.progress >= uiTask.fileSize) {
+
+              _lastUpdateTime = now;
+            }
+            
+            if (uiTask.progress >= uiTask.fileSize) {
+              break;
+            }
+          }
+        }
+        catch(e){
+          // 接收过程中发生错误
+          uiTask.errorMsg = "接收失败: $e";
+        }
+      }
+      
+      uiTask.isDone = true;
+  } catch (e) {
+    uiTask.errorMsg = e.toString();
+  } finally {
+      await TransferHistoryManager.addHistory(TransferHistory(
+      name: uiTask.fileName,
+      size: uiTask.fileSize,
+      time: DateTime.now().toString(),
+      path: Save_Path,
+      isSender: uiTask.isSender,
+      isSuccess: uiTask.isDone && uiTask.errorMsg == null,
+      ));
+    socket.destroy();
+  }
+}
 
 
   void dispose(){

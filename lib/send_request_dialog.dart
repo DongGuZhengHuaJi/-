@@ -10,7 +10,7 @@ class SendRequestDialog extends StatefulWidget {
   final String myName;
   final String path;
   final String name;
-  final int size;
+  final double size;
   final TransferService service;
   final Function(Socket) onAccept;
 

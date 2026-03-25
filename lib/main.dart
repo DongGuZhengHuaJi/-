@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
+import 'transfer_history_manager.dart';
 import 'package:my_first_app/login_page.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await TransferHistoryManager.start(); // 加载历史记录
   runApp(const MyApp());
 }
 
