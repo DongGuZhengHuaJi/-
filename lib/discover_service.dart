@@ -133,7 +133,7 @@ class DiscoverService {
     // }
     String senderIp = datagram.address.address;
     String message = utf8.decode(datagram.data);
-    Logger().i("Received UDP message: $message from ${datagram.address.address}:${datagram.port}");
+    // Logger().i("Received UDP message: $message from ${datagram.address.address}:${datagram.port}");
 
     if (message.startsWith(Config.udpDiscoveryPrefix)) {
       List<String> parts = message.split(":");

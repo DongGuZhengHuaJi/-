@@ -8,7 +8,10 @@ class UserProfile {
 
   static Future<Map<String, String>> loadUserProfile() async{
     final prefs = await SharedPreferences.getInstance();
-    String? uuid = prefs.getString(_keyUuid);
+    // String? uuid = prefs.getString(_keyUuid);
+    
+    //测试代码，生成随机 UUID，实际使用时应该从 SharedPreferences 中加载
+    String? uuid = const Uuid().v4(); // 生成一个随机 UUID
     String? name = prefs.getString(_keyName);
 
     if(uuid == null){

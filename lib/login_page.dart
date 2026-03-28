@@ -40,7 +40,7 @@ class _LoginPageState extends State<LoginPage> {
 
     if (!mounted) return;
     Navigator.pushReplacement(context, MaterialPageRoute(
-      builder: (context) => HomePage(userName: _nameController.text),
+      builder: (context) => HomePage(userName: _nameController.text, myUuid: _uuid),
     ));
   }
 

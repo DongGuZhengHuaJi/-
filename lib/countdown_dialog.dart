@@ -79,7 +79,9 @@ class _CountdownDialogState extends State<CountdownDialog> {
           onPressed: () {
             _timer?.cancel();
             widget.onReject();
-            Navigator.of(context).pop();
+            if(Navigator.canPop(context)){
+              Navigator.of(context).pop();
+            }
           },
           child: Text(widget.rejectLabel),
         ),

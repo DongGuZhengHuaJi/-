@@ -20,7 +20,16 @@ class TransferService {
   Stream<TransferTask> get onMessageReceived => _controller.stream;
 
   Future<void> start() async{
-    _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, Config.tcpPort);
+    try {
+      // 优先尝试绑定默认端口 (9999)
+      _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, Config.tcpPort);
+      Logger().i("Transfer TCP Server started on port ${Config.tcpPort}");
+    } catch (e) {
+      // 报错说明是单机双开，端口被前一个实例占了。退而求其次，使用系统随机端口 (0)
+      Logger().w("TCP Port ${Config.tcpPort} is busy. Binding to random port...");
+      _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
+      Logger().i("Transfer TCP Server started on random port ${_serverSocket!.port}");
+    }
 
     _serverSocket!.listen((Socket client) {
       Logger().i("New connection from ${client.remoteAddress.address}:${client.remotePort}");

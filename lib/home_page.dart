@@ -10,6 +10,7 @@ import 'package:file_selector/file_selector.dart';
 import 'discover_page.dart';
 import 'home_provider.dart';
 import 'transfer_page.dart';
+import 'remote_connect_page.dart';
 
 var logger = Logger(); 
 
@@ -275,7 +276,8 @@ var logger = Logger();
 
 class HomePage extends StatefulWidget {
   final String userName;
-  const HomePage({super.key, required this.userName});
+  final String myUuid;
+  const HomePage({super.key, required this.userName, required this.myUuid});
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -300,6 +302,7 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final List<Widget> subPages = [
       DiscoverSubPage(provider: _provider, onPeerSelected: _onPeerSelected),
+      RemoteConnectPage(myUuid: widget.myUuid, myName: widget.userName, provider: _provider), // 远程连接页面
       TransferPage(provider: _provider), // 传输页面，显示传输任务
     ];
 
@@ -322,6 +325,7 @@ class _HomePageState extends State<HomePage> {
         onTap: (index) => setState(() => _currentIndex = index),
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.near_me), label: "附近"),
+          BottomNavigationBarItem(icon: Icon(Icons.swap_horiz), label: "远程"),
           BottomNavigationBarItem(icon: Icon(Icons.swap_horiz), label: "传输"),
         ],
       ),
