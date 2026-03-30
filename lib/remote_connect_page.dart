@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -11,6 +13,7 @@ import 'transfer_history_manager.dart';
 import 'config.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:logger/logger.dart';
+import 'dart:async';
 
 final logger = Logger();
 
@@ -46,8 +49,15 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
   // 状态控制变量
   String? _remoteUuid; // 锁定当前对话的目标，防止发送 Candidate 时找错人
   final Map<String, List<RTCIceCandidate>> _remoteCandidatesQueues = {};
+  Completer<void>? _sendCompleter; // 用于控制发送流程的 Completer
+  Completer<void>? _windowUpdateCompleter; // 用于等待窗口更新的 Completer
+  Completer<void>? _transferCompleteCompleter; // 用于等待对方确认传输完成的 Completer
+  List<Uint8List> _receiveQueue = []; // 用于缓存接收数据的队列
+  bool _isWriting = false; // 标记当前是否正在写入文件，避免并发写入
 
-  IOSink? _activeSink; // 当前正在写入的文件句柄
+  // IOSink? _activeSink; // 当前正在写入的文件句柄
+  RandomAccessFile? _activeRaf; // 当前正在读取的文件句柄
+  int _receivedWindow = 0; // 接收窗口计数器
   TransferTaskInfo? _currentUiTask; // 关联你 UI 上的进度条对象
   int _receivedBytes = 0;
 
@@ -73,8 +83,10 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
     cancelFile = true; // 告诉发送循环停下来
     
     // 1. 如果正在接收，关闭文件流
-    _activeSink?.close();
-    _activeSink = null;
+    // _activeSink?.close();
+    // _activeSink = null;
+    _activeRaf?.close();
+    _activeRaf = null;
 
     // 2. 清理 UI 任务，移除进度条
     if (_currentUiTask != null) {
@@ -135,6 +147,7 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
       _dataChannel = channel;
       _setupDataChannelListeners();
     };
+
   }
 
   // --- 2. 发起方逻辑 (Make Call) ---
@@ -240,8 +253,17 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
   }
 
   // --- 6. 数据通道监听 ---
-  void _setupDataChannelListeners() {
+  Future<void> _setupDataChannelListeners() async {
     if (_dataChannel == null) return;
+
+    _dataChannel!.bufferedAmountLowThreshold = 512 * 1024; // 设置传输低水位阈值 512KB
+
+    // 监听：当缓冲区数据量低于阈值时触发，适合继续发送数据
+    _dataChannel!.onBufferedAmountLow = (int bufferedAmount) {
+      if(_sendCompleter != null && !_sendCompleter!.isCompleted) {
+        _sendCompleter!.complete();
+      }
+    };
 
     _dataChannel!.onDataChannelState = (state) {
       debugPrint("DataChannel 状态: $state");
@@ -249,15 +271,23 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
 
     _dataChannel!.onMessage = (RTCDataChannelMessage message) async {
       if (message.isBinary) {
-        if (_activeSink != null && _currentUiTask != null) {
-          _activeSink!.add(message.binary);
-          _receivedBytes += message.binary.length;
+        if (_activeRaf != null && _currentUiTask != null) {
+          // await _activeRaf!.writeFrom(message.binary);
+          // _receivedBytes += message.binary.length;
+          // _receivedWindow += message.binary.length;
           
-          _currentUiTask!.progress = _receivedBytes / _currentUiTask!.fileSize;
+          // _currentUiTask!.progress = _receivedBytes / _currentUiTask!.fileSize;
           
-          if (_receivedBytes >= _currentUiTask!.fileSize) {
-            await _finishReceiving();
-          }
+          // if(_receivedWindow >= 4 * 1024 * 1024){ // 每接收 4MB 就检查一次是否需要发送窗口更新
+          //    _dataChannel!.send(RTCDataChannelMessage(jsonEncode({'type': 'window_update'})));
+          //    _receivedWindow = 0;
+          // }
+
+          // if (_receivedBytes >= _currentUiTask!.fileSize) {
+          //   await _finishReceiving();
+          // }
+          _receiveQueue.add(message.binary);
+          _processReceiveQueue(); // 每次收到消息都尝试处理队列中的数据
         }
       } else {
         var info = jsonDecode(message.text);
@@ -268,6 +298,18 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
           // 收到对方的取消通知，使用统一清理函数
           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("对方取消了文件传输")));
           _abortOngoingTransfer("对方取消了文件传输");
+        }
+        else if (info['type'] == 'window_update') {
+          // 对方窗口更新，允许继续发送
+          if (_windowUpdateCompleter != null && !_windowUpdateCompleter!.isCompleted) {
+            _windowUpdateCompleter!.complete();
+          }
+        }
+        else if (info['type'] == 'transfer_complete') {
+          // 对方确认文件已完全接收并写入磁盘
+          if (_transferCompleteCompleter != null && !_transferCompleteCompleter!.isCompleted) {
+            _transferCompleteCompleter!.complete();
+          }
         }
       }
     };
@@ -290,9 +332,10 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
     }
 
     File file = File(savePath);
-    _activeSink = file.openWrite();
+    _activeRaf = await file.open(mode: FileMode.write);
     _receivedBytes = 0;
-    
+    _receivedWindow = 0;
+    _isWriting = false; // 重置写入状态
     debugPrint("开始流式接收文件: $fileName");
     if (mounted) {
       setState(() {
@@ -302,14 +345,56 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
     }
   }
 
+// 串行写入磁盘的核心队列处理机
+Future<void> _processReceiveQueue() async {
+  // 如果已经在写了，或者文件句柄没了，直接返回
+  if (_isWriting || _activeRaf == null || _currentUiTask == null) return;
+  _isWriting = true;
+
+  try {
+    // 只要队列里有数据，就一直写
+    while (_receiveQueue.isNotEmpty && _activeRaf != null) {
+      Uint8List data = _receiveQueue.removeAt(0);
+      await _activeRaf!.writeFrom(data); // 避免并发写入，确保每次写完才更新状态
+      
+      _receivedBytes += data.length;
+      _receivedWindow += data.length;
+      
+      if (mounted) {
+        setState(() {
+          _currentUiTask!.progress = _receivedBytes / _currentUiTask!.fileSize;
+        });
+      }
+
+      // 触发窗口更新
+      if (_receivedWindow >= 4 * 1024 * 1024) {
+        _dataChannel!.send(RTCDataChannelMessage(jsonEncode({'type': 'window_update'})));
+        _receivedWindow = 0;
+      }
+
+      // 检查是否全部接收并写入完毕
+      if (_receivedBytes >= _currentUiTask!.fileSize) {
+        // 关键：明确告诉发送端，我已经全部写进硬盘了！
+        _dataChannel!.send(RTCDataChannelMessage(jsonEncode({'type': 'transfer_complete'})));
+        await _finishReceiving();
+        break; // 退出循环
+      }
+    }
+  } catch (e) {
+    logger.e("写入文件时发生致命错误: $e");
+    _abortOngoingTransfer("磁盘写入失败");
+  } finally {
+    _isWriting = false; // 写完释放锁
+  }
+}
+
   Future<void> _finishReceiving() async {
-    await _activeSink?.flush();
-    await _activeSink?.close();
-    _activeSink = null;
+    await _activeRaf?.close();
+    _activeRaf = null;
 
     if (_currentUiTask != null) {
       _currentUiTask!.isDone = true;
-      
+      _transferCompleteCompleter = null;
       await TransferHistoryManager.addHistory(TransferHistory(
         name: _currentUiTask!.fileName,
         size: _currentUiTask!.fileSize,
@@ -343,7 +428,8 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
     cancelFile = false; // 每次发送前重置取消状态
 
     String fileName = path.basename(filepath);
-    int fileSize = await File(filepath).length();
+    File file = File(filepath);
+    int fileSize = await file.length();
 
     var uiTask = TransferTaskInfo(fileName: fileName, fileSize: fileSize.toDouble(), isSender: true);
     _currentUiTask = uiTask; // 记录到全局变量以便取消时访问
@@ -355,29 +441,43 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
       'size': fileSize,
     })));
 
-    var fileStream = File(filepath).openRead();
+    RandomAccessFile raf = await file.open(mode: FileMode.read);
+    const chunk = 1024 * 64; // 64KB
+    int sentSinceLastAck = 0; // 记录自上次窗口更新以来发送的字节数
     int sentBytes = 0;
+    const ackThreshold = 4 * 1024 * 1024; // 每发送 4MB 就等待一次窗口更新
 
-    await for (var chunk in fileStream) {
-      // 检查是否取消
-      if (cancelFile) {
-        logger.i("文件传输已手动取消，停止读取文件流");
-        break;
-      }
-      
-      // 解决背压死锁：在等待缓冲区清空时，也要检查是否取消
-      while ((_dataChannel?.bufferedAmount ?? 0) > 1024 * 1024) {
-        if (cancelFile) break; 
-        await Future.delayed(const Duration(milliseconds: 20));
-      }
-      
-      // 退出 while 循环后再次检查
-      if (cancelFile) break;
+    try{
+      while(sentBytes < fileSize && !cancelFile){
+        if((_dataChannel!.bufferedAmount ?? 0) > 1024 * 1024 * 2){
+          _sendCompleter = Completer<void>();
+          await _sendCompleter!.future;
+          _sendCompleter = null;
+        }
 
-      _dataChannel?.send(RTCDataChannelMessage.fromBinary(Uint8List.fromList(chunk)));
-      
-      sentBytes += chunk.length;
-      uiTask.progress = sentBytes / fileSize; 
+        if(sentSinceLastAck >= ackThreshold){
+          _windowUpdateCompleter = Completer<void>();
+          await _windowUpdateCompleter!.future;
+          _windowUpdateCompleter = null;
+          sentSinceLastAck = 0;
+        }
+
+        if(cancelFile) break;
+        int bytesToRead = min(chunk, fileSize - sentBytes);
+        Uint8List buffer = await raf.read(bytesToRead);
+        _dataChannel!.send(RTCDataChannelMessage.fromBinary(buffer));
+        sentBytes += buffer.length;
+        sentSinceLastAck += buffer.length;
+        uiTask.progress = sentBytes / fileSize;
+      }
+
+    }catch(e){
+      _sendCompleter?.complete(); // 确保如果在等待发送时发生错误，能跳出等待状态
+      _windowUpdateCompleter?.complete(); // 确保如果在等待窗口更新时发生错误，能跳出等待状态
+      logger.e("文件传输过程中发生错误: $e");
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("文件传输失败")));
+      _abortOngoingTransfer("文件传输失败: $e");
+      return;
     }
 
     // --- 传输结束后的状态处理 ---
@@ -400,6 +500,11 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
       return; // 提前退出，不执行下面的成功逻辑
     }
 
+    _transferCompleteCompleter = Completer<void>();
+    // 等待对方确认传输完成（即对方文件已写入磁盘）
+    await _transferCompleteCompleter!.future;
+    _transferCompleteCompleter = null;
+
     // 成功传输逻辑
     uiTask.isDone = true;
     await TransferHistoryManager.addHistory(TransferHistory(
@@ -413,6 +518,9 @@ class _RemoteConnectPageState extends State<RemoteConnectPage> {
     
     widget.provider.removeActiveTask(uiTask);
     _currentUiTask = null;
+    _sendCompleter?.complete(); // 确保如果在等待发送时完成了传输，能跳出等待状态
+    _windowUpdateCompleter?.complete(); // 确保如果在等待窗口更新时完成了传输，能跳出等待状态
+     debugPrint("文件发送完毕");
   }
 
   void _sendSignalingMessage(Map<String, dynamic> message) {
